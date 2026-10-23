@@ -1080,7 +1080,7 @@ function reportMeta() {
   /**
    * ⭐ 值班轮能看到哪些 MCP 工具（2026-10-17 审查里的 H3）
    *    起因：overlay 把整台 mcp_server.py 挂成 stdio server ⇒ 那一轮的模型手里握着**原生全套**工具
-   *    （bili_reply / bili_crawl / bili_send_opus / bili_upload_video / bili_login…）——
+   *    （bili_reply / bili_crawl / bili_send_message / bili_login…；上传视频/发动态/发专栏这几只 2026-10-23 已整个删掉）——
    *    宿主这边 autoComment / mentionName 两道闸只拦得住我们自己的 bili_reply 工具，拦不住它 ✗。
    *    做法：白名单写进 overlay 的 env（mcp-client 会把它并进子进程环境），
    *    mcp_server.py 那头**不在白名单里的工具根本不注册** —— 连名字都不给它看见 ✓。
