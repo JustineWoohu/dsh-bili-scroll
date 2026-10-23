@@ -20,6 +20,7 @@ import asyncio
 import json
 import base64
 import os
+import struct
 import sys
 import tempfile
 from pathlib import Path
@@ -1289,6 +1290,32 @@ def _snapshot_entries(data: dict, duration: float = 0.0) -> list:
     return [(v / scale, i) for v, i in raws]
 
 
+async def _entries_from_pvdata(data: dict, cred) -> list:
+    """`index` 为空时的兜底：从 `pvdata` 那份二进制时间表里恢复切片时间。
+
+    实测（2026-10-23，三个视频逐一比对过）：`pvdata` 指向一个 .bin，
+    内容是**大端 uint16 的秒数数组**，跟 `index` 逐项相同。
+    例：120 秒视频 → 34 字节 → 17 项 → `[0, 0, 5, 10, 16, 24, …]`。
+
+    它比 `index` 稳：`index` 空的那几次，`pvdata` 照样有值。
+    """
+    url = str(data.get("pvdata") or "")
+    if not url:
+        return []
+    if url.startswith("//"):
+        url = "https:" + url
+    try:
+        raw = await _fetch_bytes(url, _image_cookie(cred))
+    except Exception:
+        return []
+    if not raw or len(raw) % 2:
+        return []
+    count = len(raw) // 2
+    if count > 20000:            # 明显不对，别乱解
+        return []
+    return [(float(sec), i) for i, sec in enumerate(struct.unpack(f">{count}H", raw))]
+
+
 async def _fetch_bytes(url: str, headers: dict) -> bytes:
     import aiohttp
 
@@ -1349,32 +1376,35 @@ async def bili_frames(bvid: str, num: int = 3, at: list | None = None) -> list:
     if not cid:
         return _text_only({"bvid": bvid, "ok": False, "error": "拿不到 cid"})
 
-    # ⚠️ 2026-10-23 实测：这个故事板接口**会偶发返回空 index**（同一个视频、同样的参数，
-    #    有时 17 个切片、有时 0 个；连测 6 次又全是 17）。值班轮里就因为这一下，
-    #    模型把"这一瞬间拿了个空"写成了"这个视频没有故事板"。
-    #    ⇒ 空结果重试 3 次（间隔 1.2 秒），别把一次抖动当成"没有"。
-    snap = None
+    # ⚠️ 2026-10-23 实测：这个故事板接口**会偶发返回空 index** ——
+    #    HTTP 200、code=0、`image` 有，唯独 `index` 是空数组；15 次采样里空了 5 次（约 1/3），
+    #    跟并发无关（单发也会空），像是后端副本没同步。
+    #    值班轮里就因为这一下，模型把"这一瞬间拿了个空"写成了"这个视频没有故事板"。
+    #    ⇒ 三道防线：① 先读 `index`；② 空就用同响应里 `pvdata` 那份二进制时间表兜底；
+    #      ③ 两个都空才重试（最多 3 次）。
+    snap = {}
+    entries = []
     last_err = None
     for attempt in range(3):
         try:
-            snap = await v.get_video_snapshot(cid=cid, json_index=True, pvideo=False)
+            snap = await v.get_video_snapshot(cid=cid, json_index=True, pvideo=False) or {}
             last_err = None
         except Exception as e:
-            snap, last_err = None, e
-        if snap and (snap.get("index") or []) and (snap.get("image") or []):
+            snap, last_err = {}, e
+        entries = _snapshot_entries(snap, duration)
+        if not entries:
+            entries = await _entries_from_pvdata(snap, cred)
+        if entries and (snap.get("image") or []):
             break
         if attempt < 2:
             await asyncio.sleep(1.2)
 
-    if last_err is not None and not (snap or {}).get("index"):
-        return _text_only({"bvid": bvid, "ok": False, "error": f"取画面快照失败（重试 3 次）：{last_err}"})
-
-    entries = _snapshot_entries(snap or {}, duration)
-    sheets = (snap or {}).get("image") or []
+    sheets = snap.get("image") or []
     if not entries or not sheets:
+        err = f"（最后一次错误：{last_err}）" if last_err is not None else ""
         return _text_only({
             "bvid": bvid, "ok": False,
-            "error": "取不到画面快照（重试 3 次都是空）—— B站可能没给这条生成故事板",
+            "error": f"取不到画面快照（index 与 pvdata 都空，试了 3 次）{err}",
         })
 
     # 目标时间点：传了 at 就用它；否则按时长均分
