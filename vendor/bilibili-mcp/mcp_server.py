@@ -1047,10 +1047,29 @@ async def bili_send_message(receiver_uid: int, text: str) -> str:
             msg_type=session.EventType.TEXT,
             content=text.strip(),
         )
+        # ⭐ 2.0.4（issue #35）：**接口没抛异常 ≠ 真的送到了** ——
+        #    以前只要不抛就报 success: True，而 B站 可能出现 code=0 却没给投递回执（msg_key）的情况 ✗
+        #    回执就在返回值里：有 msg_key 才算发出去；code 非 0 直接算失败 ✓
+        data = result if isinstance(result, dict) else {}
+        code = data.get("code", 0)
+        inner = data.get("data")
+        msg_key = data.get("msg_key") or (inner.get("msg_key") if isinstance(inner, dict) else None)
+        if code not in (0, None):
+            return json.dumps({
+                "success": False,
+                "error": f"接口拒绝（code={code}）：{data.get('message') or data.get('msg') or '未知原因'}",
+                "data": data,
+            }, ensure_ascii=False)
+        if not msg_key:
+            return json.dumps({
+                "success": False,
+                "error": "接口回了成功，但**没有投递回执（msg_key）** ⇒ 可能没真正送到（常见于：对方不接受陌生人私信 / 被风控）",
+                "data": data,
+            }, ensure_ascii=False)
         return json.dumps({
             "success": True,
-            "message": f"私信已发送给UID:{receiver_uid}",
-            "data": result if isinstance(result, dict) else str(result),
+            "message": f"私信已投递（回执 {str(msg_key)[:12]}…）",
+            "data": data,
         }, ensure_ascii=False)
     except Exception as e:
         return json.dumps({"success": False, "error": str(e)}, ensure_ascii=False)

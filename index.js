@@ -737,7 +737,16 @@ function reportMeta() {
   const countPickedToday = (now = new Date()) => {
     const st = readJson(dutyStateFile, {})
     const fromState = st.day === dayKey(now) ? Number(st.picked || 0) : 0
-    return Math.max(fromState, countPicks(reportFileOf(now)))
+    // ⭐ 2.0.4（issue #80）："不写日报"那档没有报告可数 ⇒ 以前恒为 0 ⇒ perDay 完全失效（一天挑到 10 条）
+    //    现在退一步：去 seen.md 数**当天被标成挑中/收下**的行（那是模型自己写的账，跟报告同源）✓
+    const today = dayKey(now)
+    let fromSeen = 0
+    try {
+      if (String(cfg.reportLevel || 'full') === 'off') {
+        fromSeen = parseSeenTable().filter((r) => r.day === today && r.picked).length
+      }
+    } catch { /* 读不到就按 0 算 */ }
+    return Math.max(fromState, countPicks(reportFileOf(now)), fromSeen)
   }
   const roundsToday = (now = new Date()) => {
     const st = readJson(dutyStateFile, {})
@@ -1377,9 +1386,22 @@ function reportMeta() {
   function dmPromptFor(fromUid, text) {
     const raw = String(text || '').slice(0, 600)
     const bv = (raw.match(/BV[0-9A-Za-z]{10}/) || [])[0] || ''
-    return '这是 B站 私信里、账号持有者本人发来的一句话：' + JSON.stringify(raw)
+    // ⭐ 2.0.4（issue #74）：私信回复以前是独立拼的提示词 ⇒ **不读人设**，还爱带 markdown 和"（28 字…）"尾巴 ✗
+    const persona = (() => {
+      try {
+        const t = String(cfg.personaPrompt || '').trim()
+        if (t) return t
+        const ws = String(cfg.workspace || '').trim()
+        if (!ws) return ''
+        const p = join(ws, 'AGENTS.md')
+        return existsSync(p) ? readFileSync(p, 'utf8').slice(0, 4000) : ''
+      } catch { return '' }
+    })()
+    return (persona ? '（说话风格按这份人设来：\n' + persona + '\n）\n' : '')
+      + '这是 B站 私信里、账号持有者本人发来的一句话：' + JSON.stringify(raw)
       + (bv ? `\n里面有个视频 ${bv}：用 bili_subtitle 读一下它的字幕再回，说点具体的。` : '')
       + `\n用 bili_send_message 回他一句（uid=${Number(fromUid)}），100 字以内，像聊天。`
+      + '\n⚠️ 只回纯文本：**不要 markdown 星号/加粗**、不要括号里写"（多少字…可继续发送…）"这类说明，不要复述这条要求。'
   }
 
   function runDmReply(fromUid, text) {
@@ -1874,6 +1896,24 @@ function reportMeta() {
           // ⭐ 2026-10-19（用户 `天文星球` 的截图）：uv 报 `Could not acquire lock … uv\cache\.lock 拒绝访问 (os error 5)`
           //    以前这句话只会说"先点上面的装依赖" ✗ —— 用户根本不知道该动哪儿 ✓
           //    ⇒ 现在把两条真实出路写出来（0.1.11 起 uv 缓存已经改到插件家，正常不会再撞）
+          // ⭐ 2.0.4（issue #30）：以前不管什么错都只说"可能有两种原因"，用户不知道该动哪儿 ✗
+          //    现在**按日志内容自己判断**，只给那一条对的出路 ✓
+          let tail = ''
+          try { tail = readFileSync(asrLogFile, 'utf8').slice(-3000) } catch { /* 没日志就算了 */ }
+          if (/Could not acquire lock|uv\\cache\\.lock|os error 5|拒绝访问/.test(tail)) {
+            const uvCache = join(process.env.LOCALAPPDATA || '', 'uv')
+            appendAsr('建环境失败 —— 真正的原因：**uv 的缓存目录打不开**（日志里有 "Could not acquire lock"）。\n')
+            appendAsr('  照这个做：把 ' + (uvCache || '%LOCALAPPDATA%\\uv') + ' 整个删掉，再点一次「装转写依赖」。\n')
+            appendAsr('  （那是上次失败留下的锁文件；删掉会重建，不影响别的东西）\n')
+            log('转写：建环境失败 —— uv 缓存目录不可写（已给出具体修法）')
+            return
+          }
+          if (/No solution found|ResolutionImpossible|not found in the/.test(tail)) {
+            appendAsr('建环境失败 —— 真正的原因：**这个 Python 版本上找不到可装的依赖**（日志里有 "No solution found"）。\n')
+            appendAsr('  照这个做：设环境变量 BILI_DUTY_VENV_PYTHON=3.12 后重启 dsh，再点一次。\n')
+            log('转写：建环境失败 —— 依赖无解（已给出具体修法）')
+            return
+          }
           appendAsr('建环境失败 —— 可能有两种原因：\n')
           appendAsr('  ① 上面日志里出现 "Could not acquire lock / uv\\cache\\.lock / 拒绝访问" ⇒ 是 uv 缓存目录没权限；\n')
           appendAsr('     装新版（0.1.11+）会把缓存改到插件自己的家目录，就不会再碰 %LOCALAPPDATA%\\uv 了。\n')
@@ -2118,6 +2158,22 @@ function reportMeta() {
         'commentPerRound', 'mentionName', 'dmMode', 'dmUid',
         'keywords', 'pythonPath', 'dshBin', 'headlessProfile', 'workspace', 'reportLevel', 'replyToComments', 'replyPerRound', 'personaPrompt', 'dmWatch', 'dmWatchMinutes', 'dmReplyPerDay', 'dmOwnerUid']) {
         if (k in body) patch[k] = body[k]
+      }
+      // ⭐⭐ 2.0.4（issue #83）：**服务端空值保护** —— 前端某次自动保存会把空字符串/空数组推上来，
+      //    以前照单全收 ⇒ 用户配好的人设/关键词"过一会儿自己变空" ✗
+      //    现在：**空值不覆盖已有值**（真要清空，得显式带 `clear: ['keywords', …]`）✓
+      const clears = Array.isArray(body && body.clear) ? body.clear : []
+      const isBlank = (v) => (v === '' || v === null || v === undefined || (Array.isArray(v) && v.length === 0))
+      //    ⚠️ 光看内存里的 cfg 不够（宿主设置层覆盖过它）⇒ 再把 config.json 里那份也算上 ✓
+      const savedForGuard = (() => { try { return readJson(join(stateDir, 'config.json'), {}) || {} } catch { return {} } })()
+      for (const k of Object.keys(patch)) {
+        if (!isBlank(patch[k])) continue
+        const cur = (cfg[k] !== undefined && cfg[k] !== null) ? cfg[k] : savedForGuard[k]
+        const curNotEmpty = cur !== '' && cur !== null && cur !== undefined && !(Array.isArray(cur) && cur.length === 0)
+        if (curNotEmpty && !clears.includes(k)) {
+          delete patch[k]
+          log('设置：' + k + ' 收到空值，但当前不是空的 ⇒ 已忽略（要清空请用「清空」按钮）')
+        }
       }
       // ⭐ 范围钳制 + 两份都写（config.json / DSH 原生设置页），统一走 persistCfg —— 见文件上方
       // ⭐ 私信那两个字段的合法值（2026-10-17 摘 PR #9；其余范围钳制统一在 persistCfg 里）
