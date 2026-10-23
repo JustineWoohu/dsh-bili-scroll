@@ -447,12 +447,14 @@ function reportMeta() {
     try {
       if (existsSync(marker)) return
       const saved = readJson(join(stateDir, 'config.json'), {}) || {}
-      const oldAll = saved.dmWatch === false
-        && Number(saved.dmWatchMinutes) === 5
+      // ⭐⭐ 2.0.4（第三方体检第 4 条）：**绝不把用户关掉的开关重新打开** ✗
+      //    以前判据是"三项都还是旧默认"，而"用户主动关掉、其它项没动"跟"从没设置过"长得一模一样
+      //    ⇒ 升级后他的私信监听又被打开。现在只迁"间隔/条数"，开关保持他设的样子 ✓
+      const oldInterval = Number(saved.dmWatchMinutes) === 5
         && Number(saved.dmReplyPerDay) === 3
-      if (oldAll) {
-        persistCfg({ dmWatch: true, dmWatchMinutes: 1, dmReplyPerDay: 0 })
-          .then(() => log('已把「私信双向」迁到 2.0 的默认：开着、每 1 分钟查一次、不限条数'))
+      if (oldInterval) {
+        persistCfg({ dmWatchMinutes: 1, dmReplyPerDay: 0 })
+          .then(() => log('已把私信间隔/条数迁到 2.0 的默认（每 1 分钟、不限条数）；开关按你自己的设置保持不变'))
           .catch((e2) => log('迁移私信默认值失败（不影响使用）：' + String(e2?.message ?? e2)))
       }
       writeFileSync(marker, String(Date.now()), 'utf8')
@@ -1064,7 +1066,10 @@ function reportMeta() {
    */
   const mcpWhitelist = () => {
     const list = ['bili_search', 'bili_subtitle', 'bili_comments', 'bili_video_info']
-    if (cfg.autoComment || cfg.replyToComments) list.push('bili_reply')   // 只有真要发评论才给这只
+    // ⭐⭐ 2.0.4（第三方体检第 3 条）：**"只发私信"时评论通道必须硬关** —— 以前只看 autoComment，
+    //    用户以前开过自动评论、后来切到"只私信"，那个 true 还在 config 里 ⇒ 评论工具照样下发 ✗
+    const dmOnly = String(cfg.dmMode || '').trim() === 'only'
+    if (!dmOnly && (cfg.autoComment || cfg.replyToComments)) list.push('bili_reply')
     // ⭐ 2026-10-19（issue #25 / #16 的实证，做法参考社区 PR #37）：私信开着却忘了给 bili_send_message ⇒
     //   模型手里压根没有这只工具 ⇒ 表现成"开关也开了、这一轮也跑了，但从来没发出去过" ✗
     //   ⇒ dmMode 不是 off、且填了收件人 UID 才放进去（关着就不给，白名单别松）
@@ -1183,8 +1188,20 @@ function reportMeta() {
     } catch (e) { log(`补占位报告失败：${e?.message ?? e}`) }
   }
 
+  // ⭐⭐ 2.0.4（第三方体检第 2 条）：**同一时间只允许一轮在跑**，并且**登记这个子进程**，
+  //    关页面/卸载插件时能把它一起收掉（以前它没有锁、也不归 ctx.effect 管 ✗）。
+  let dutyChild = null
+  let dutyStartedAt = 0
   const runDuty = (why = 'window') => {
    try {
+      if (dutyChild) {
+        const alive = dutyChild.exitCode === null && !dutyChild.killed
+        if (alive) {
+          log('这一轮没跑（' + why + '）：上一轮还没结束（pid=' + dutyChild.pid + '，已跑 ' + Math.round((Date.now() - dutyStartedAt) / 1000) + ' 秒）')
+          return { started: false, why, busy: true, error: '上一轮还没跑完' }
+        }
+        dutyChild = null
+      }
     refreshCfg()          // ⭐ 设置页刚改过的值要立刻生效（config 是就地改的，快照会过期）
     const dsh = resolveDsh()
     // ⭐ 找不到 dsh 就别硬跑：以前会退化成裸 `dsh` ⇒ spawn 失败、只留 exit 1 + 一串乱码 ✗
@@ -1257,7 +1274,12 @@ function reportMeta() {
       const verifyTimer = setTimeout(() => { Promise.resolve(runVerify('round')).catch((e) => log('复核异常：' + (e?.message ?? e))) }, 90_000)
       verifyTimer.unref?.()   // 别为了一次复核把宿主进程的退出拖住 90 秒
     })
+    child.on('close', () => { if (dutyChild === child) dutyChild = null })
+    dutyChild = child
+    dutyStartedAt = Date.now()
     child.on('error', (e) => log(`刷B站起不来：${e?.message ?? e}`))
+    // ⭐ 起不来/被杀掉也要把锁放开，否则之后每一轮都会被判成'上一轮还没结束' ✗
+    child.on('close', () => { if (dutyChild === child) dutyChild = null })
     return { started: true, why, profile: cfg.headlessProfile, cwd, log: logFile }
    } catch (e) {
     log(`刷B站开跑失败（${why}）：${e?.stack ?? e}`)
@@ -1421,9 +1443,14 @@ function reportMeta() {
         const last = [...msgs].reverse().find((m) => !m.fromMe)
         if (!last) continue
         if (seen[String(s.uid)] === last.key) continue
+        // ⭐⭐ 2.0.4（第三方体检第 1 条）：额度判断必须在"记账"之前 ✗
+        //    以前先写 seen 再判额度 ⇒ 那条被标成"已处理"、额度恢复或第二天也不会再回 ✗
+        if (Number(cfg.dmReplyPerDay) > 0 && quota.n >= Number(cfg.dmReplyPerDay)) {
+          log('私信监听：今天额度用完了（' + quota.n + '/' + cfg.dmReplyPerDay + '）⇒ 这条先不回，明天会自动补')
+          continue
+        }
         seen[String(s.uid)] = last.key
         writeJsonFile(dmSeenFile, seen)
-        if (Number(cfg.dmReplyPerDay) > 0 && quota.n >= Number(cfg.dmReplyPerDay)) { log('私信监听：今天的回复额度用完了（' + quota.n + '）⇒ 这条先不回'); continue }
         log(`私信监听：收到新消息 —— ${last.text.slice(0, 40)}`)
         runDmReply(s.uid, last.text)
         quota.n++
@@ -1450,6 +1477,15 @@ function reportMeta() {
 
   try { startDmWatch() } catch (e) { log('私信监听没起来：' + String(e?.message ?? e)) }
   ctx.effect(() => () => { try { if (dmTimer) clearInterval(dmTimer) } catch { /* 忽略 */ } }, 'bili-duty: 私信监听')
+  // ⭐ 2.0.4：插件被卸载/宿主退出时，把还在跑的那一轮一起收掉（以前它会变孤儿进程）
+  ctx.effect(() => () => {
+    try {
+      if (dutyChild && dutyChild.exitCode === null && !dutyChild.killed) {
+        log('插件正在卸载/退出 ⇒ 收掉还在跑的那一轮')
+        try { dutyChild.kill() } catch { /* 杀不掉就算了 */ }
+      }
+    } catch { /* 忽略 */ }
+  }, 'bili-duty: 跑一轮的子进程')
 
   /* ─────────────── HTTP（设置页用） ─────────────── */
 
@@ -2246,11 +2282,20 @@ function reportMeta() {
         catch (e) { return '（日志读不到：' + String(e?.message ?? e) + '）' }
       })()
       const free = (() => { try { const s = statSync ? null : null; return '' } catch { return '' } })()
+      // ⭐⭐ 2.0.4（第三方体检第 5 条）：脱敏改成**按字段白名单遮** ——
+      //    以前只遮 dmUid，人设全文 / 昵称 / 工作区路径全在，而"复制诊断"是会被贴到群里的 ✗
       const masked = (() => {
+        const SENSITIVE = ['personaPrompt', 'mentionName', 'workspace', 'dshBin', 'dmUid', 'dmOwnerUid', 'keywords']
         const c = { ...cfg }
-        for (const k of ['dmUid']) c[k] = c[k] ? '(已填)' : ''
+        for (const k of SENSITIVE) {
+          const v = c[k]
+          if (v === undefined || v === null || v === '' || (Array.isArray(v) && !v.length)) { c[k] = ''; continue }
+          c[k] = Array.isArray(v) ? '(已填 ' + v.length + ' 项)' : '(已填 ' + String(v).length + ' 字)'
+        }
         return JSON.stringify(c, null, 2)
       })()
+      // ⭐ 日志里会打"收到新消息 —— 前 40 字"，那等于把私信内容塞进诊断信息 ⇒ 一律略去
+      const tailSafe = tail.split('\n').map((line) => (/收到新消息|私信内容|私信监听：收到/.test(line) ? '（一行私信内容已略去）' : line)).join('\n')
       return [
         '=== 刷B站 诊断信息 ===',
         '版本：' + myVersion(),
@@ -2269,8 +2314,8 @@ function reportMeta() {
         '--- 配置（已脱敏）---',
         masked,
         '',
-        '--- duty.log 末尾 ---',
-        tail,
+        '--- duty.log 末尾（私信内容已略去）---',
+        tailSafe,
       ].join('\n')
     }
 
@@ -2283,8 +2328,31 @@ function reportMeta() {
       catch (e) { put('能找到 dsh（跑一轮要用）', false, String(e?.message ?? e), '同上') }
       // ② Python
       put('Python 主依赖装好了', venvReadyNow(), missingVenvDeps().length ? '缺：' + missingVenvDeps().join(' / ') : '就绪', '点「重装主依赖」，等它跑完再看这里')
-      // ③ 凭证
-      put('B站 已登录', hasCredential(), hasCredential() ? '家目录里有凭证文件' : '还没有凭证', '点「扫码登录」，手机确认时选「记住我 / 长期」')
+      // ③ 凭证 —— ⭐ 2.0.4（第三方体检第 6 条）：以前只看"文件在不在"，登录过期了照样显示"已登录" ✗
+      //    现在真带 cookie 问一次 nav，isLogin=false 就明确报不 OK
+      if (!hasCredential()) {
+        put('B站 已登录', false, '还没有凭证', '点「扫码登录」，手机确认时选「记住我 / 长期」')
+      } else {
+        let loggedIn = false
+        let loginDetail = '家目录里有凭证文件，但没能验真（网络不通？）'
+        try {
+          const c = dmCred(stateDir)
+          if (c && (c.sessdata || c.SESSDATA)) {
+            const r = await fetch('https://api.bilibili.com/x/web-interface/nav', {
+              headers: { 'User-Agent': 'Mozilla/5.0', Cookie: 'SESSDATA=' + (c.sessdata || c.SESSDATA) },
+              signal: AbortSignal.timeout ? AbortSignal.timeout(8000) : undefined,
+            })
+            const j = await r.json().catch(() => null)
+            loggedIn = Boolean(j && j.data && j.data.isLogin)
+            loginDetail = loggedIn
+              ? ('已登录：' + (j.data.uname || '（没拿到昵称）') + '（uid ' + (j.data.mid || '?') + '）')
+              : '凭证还在，但 B站 说这个登录已经失效'
+          } else {
+            loginDetail = '凭证文件里缺 SESSDATA'
+          }
+        } catch (e) { loginDetail = '验真请求失败：' + String(e?.message ?? e) }
+        put('B站 已登录（真验一次）', loggedIn, loginDetail, '点「扫码登录」重新扫一次，手机确认时选「记住我 / 长期」')
+      }
       // ④ 家目录可写
       let writable = true
       try { const t = join(stateDir, '.diag-write-test'); writeFileSync(t, 'x'); rmSync(t) } catch { writable = false }
