@@ -596,32 +596,40 @@ function reportMeta() {
     },
   }
 
-  /** 把 MCP 回来的图存成附件引用，返回 { ok, refs } 或 { ok:false, hint } */
+  /** 把 MCP 回来的图存成附件引用，返回 { ok, refs } 或 { ok:false, reason, hint } */
   const attachImages = async (exec, images) => {
     const attachments = ctx.get('attachments')
-    const llm = ctx.get('llm')
-    let canSee = false
-    try {
-      const routed = exec?.agent?.session?.requestHeader?.()?.config
-      const provider = routed?.provider ?? exec?.agent?.options?.provider
-      const model = routed?.model ?? exec?.agent?.options?.model
-      const info = await llm?.resolveModelInfo?.(provider, model, exec?.signal)
-      canSee = Boolean(info?.inputModalities?.includes('image'))
-    } catch { canSee = false }
-
     if (!attachments?.saveImages) {
-      return { ok: false, hint: '宿主的图片服务不可用（ctx.get("attachments") 是空的），图没能附上' }
+      return { ok: false, reason: 'attachments', hint: '宿主的图片服务不可用（ctx.get("attachments") 是空的）' }
     }
-    if (!canSee) {
-      return { ok: false, hint: '当前模型不支持图片输入，图没能附上 —— 换个支持看图的模型再试' }
+
+    const llm = ctx.get('llm')
+    const routed = exec?.agent?.session?.requestHeader?.()?.config
+    const provider = routed?.provider ?? exec?.agent?.options?.provider
+    const model = routed?.model ?? exec?.agent?.options?.model
+    if (!llm?.resolveModelInfo) {
+      return { ok: false, reason: 'model_probe', hint: `查不到模型能力（provider=${provider} model=${model}）` }
     }
+    let modalities
+    try {
+      modalities = (await llm.resolveModelInfo(provider, model, exec?.signal))?.inputModalities
+    } catch (e) {
+      return { ok: false, reason: 'model_probe', hint: `查模型能力失败（${provider}/${model}）：${String(e?.message ?? e)}` }
+    }
+    if (!Array.isArray(modalities)) {
+      return { ok: false, reason: 'model_probe', hint: `模型 ${provider}/${model} 没声明输入模态` }
+    }
+    if (!modalities.includes('image')) {
+      return { ok: false, reason: 'model_no_image', hint: `模型 ${provider}/${model} 不支持图片输入（${modalities.join(',') || '无'}）` }
+    }
+
     try {
       const refs = await attachments.saveImages(
         images.map((i) => ({ data: Buffer.from(i.data, 'base64'), mediaType: i.mimeType })),
       )
       return { ok: true, refs }
     } catch (e) {
-      return { ok: false, hint: '存图片失败：' + String(e?.message ?? e) }
+      return { ok: false, reason: 'save_failed', hint: '存图片失败：' + String(e?.message ?? e) }
     }
   }
 
@@ -641,7 +649,7 @@ function reportMeta() {
       const a = await attachImages(exec, [img])
       return a.ok
         ? { ...meta, image_attached: true, image: a.refs[0] }
-        : { ...meta, image_attached: false, hint: a.hint }
+        : { ...meta, image_attached: false, image_skip_reason: a.reason, hint: a.hint }
     },
   })
 
@@ -670,7 +678,7 @@ function reportMeta() {
       const a = await attachImages(exec, images)
       return a.ok
         ? { ...meta, image_attached: true, images: a.refs }
-        : { ...meta, image_attached: false, hint: a.hint }
+        : { ...meta, image_attached: false, image_skip_reason: a.reason, hint: a.hint }
     },
   })
 
