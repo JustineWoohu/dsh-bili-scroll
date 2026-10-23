@@ -14,6 +14,7 @@ B站数据采集 MCP 服务，支持 OpenClaw / Claude Code / Cursor / Cline
 #      ③ 登录成功后凭证**原子写**（先写 .tmp 再 os.replace）
 #      ④ `bili_comments` 把抓取异常带进返回（风控 -412 不再伪装成"这条视频 0 条评论"）
 #      ⑤ `bili_reply` 回执带上 `rpid` / `rpid_str` / `root` / `parent`（判重表与评论复核要用）
+#      ⑥ `bili_cover`：封面**作为图片**返回（上游没有；图能不能进模型上下文由宿主判断）
 import asyncio
 import json
 import base64
@@ -22,6 +23,7 @@ import sys
 import tempfile
 from pathlib import Path
 from mcp.server.fastmcp import FastMCP
+from mcp.types import ImageContent, TextContent
 
 from bilibili_api import video, search, comment, Credential, dynamic, opus
 from bilibili_api import hot, rank, user, session, favorite_list
@@ -1132,6 +1134,110 @@ async def bili_received_at_and_likes() -> str:
     except Exception as e:
         result["likes_error"] = str(e)
     return json.dumps(result, ensure_ascii=False)
+
+
+# ========== Tool 25: 看画面（封面） ==========
+#
+# ⭐ 2026-10-23 新增（上游没有）。三条设计口径：
+#   1. 图**直接作为 MCP image content 返回**，能不能进模型上下文由宿主判断 ——
+#      dsh-mcp-client 会校验模型是否声明 image 输入，不支持就把图降级成一行文本，不会崩。
+#      所以这里不做"先调视觉模型转文字"的绕路。
+#   2. 缩图**交给 B 站图片 CDN**（URL 后缀 `@512w.jpg`），不引 Pillow、不调 ffmpeg：
+#      实测 1920×1080 / 299KB 的原图 → 512×288 / 30KB，等比不裁切。
+#   3. **不落临时文件**：一张 30KB 直接读进内存转 base64，没有清理问题。
+
+_WEB_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+)
+_COVER_WIDTH = 512
+_MAX_IMAGE_BYTES = 1_500_000   # 超过就不给：宁可少一张图，也别把上下文塞爆
+
+
+def _cover_url(pic: str, width: int = _COVER_WIDTH) -> str:
+    """封面原图地址 → 带缩放后缀的 CDN 地址。
+
+    B 站图片 CDN 支持 `@<宽度>w.<格式>`：等比缩到指定宽度（实测 1920×1080 → 512×288）。
+    原地址可能已经带 @ 参数（如 @1c.png），先砍掉再拼，免得拼出两个 @。
+    """
+    base = str(pic).split("@", 1)[0]
+    if base.startswith("//"):
+        base = "https:" + base
+    return f"{base}@{width}w.jpg"
+
+
+def _image_cookie(cred) -> dict:
+    h = {"User-Agent": _WEB_UA, "Referer": "https://www.bilibili.com/"}
+    if cred:
+        h["Cookie"] = (
+            f"SESSDATA={cred.sessdata}; bili_jct={cred.bili_jct}; buvid3={cred.buvid3 or ''}"
+        )
+    return h
+
+
+def _text_only(payload: dict) -> list:
+    return [TextContent(type="text", text=json.dumps(payload, ensure_ascii=False))]
+
+
+@tool()
+async def bili_cover(bvid: str) -> list:
+    """
+    看这个视频的封面（等比缩到 512px 宽）
+
+    最便宜的一档"看一眼"：能看出风格、标题美术、大致题材，但看不出具体发生了什么。
+
+    Args:
+        bvid: 视频BV号，如"BV1uNk1YxEJQ"
+
+    Returns:
+        封面图 + 一句说明（标题、时长、图多大）。
+        图能不能真被看见取决于当前模型是否支持图片输入；不支持时会被降级成文字。
+    """
+    import aiohttp
+
+    cred = load_credential()          # 封面是公开的，没登录也取得到
+    v = video.Video(bvid=bvid, credential=cred)
+    info = await v.get_info()
+
+    pic = str(info.get("pic") or "")
+    if not pic:
+        return _text_only({"bvid": bvid, "ok": False, "error": "这个视频没有封面地址"})
+
+    url = _cover_url(pic)
+    try:
+        timeout = aiohttp.ClientTimeout(total=25)
+        async with aiohttp.ClientSession(timeout=timeout) as s:
+            async with s.get(url, headers=_image_cookie(cred)) as resp:
+                if resp.status != 200:
+                    raise RuntimeError(f"HTTP {resp.status}")
+                raw = await resp.read()
+                mime = (resp.headers.get("Content-Type") or "image/jpeg").split(";")[0].strip()
+    except Exception as e:
+        return _text_only({"bvid": bvid, "ok": False, "error": f"下载封面失败：{e}"})
+
+    allowed = ("image/jpeg", "image/png", "image/webp", "image/gif")
+    if mime not in allowed:
+        return _text_only({"bvid": bvid, "ok": False, "error": f"封面不是可用的图片类型：{mime}"})
+    if len(raw) > _MAX_IMAGE_BYTES:
+        return _text_only({
+            "bvid": bvid, "ok": False,
+            "error": f"封面太大（{len(raw) // 1024}KB），没放进来",
+        })
+
+    return [
+        TextContent(type="text", text=json.dumps({
+            "bvid": bvid,
+            "ok": True,
+            "title": info.get("title"),
+            "duration": info.get("duration"),
+            "cover_kb": round(len(raw) / 1024, 1),
+        }, ensure_ascii=False)),
+        ImageContent(
+            type="image",
+            data=base64.b64encode(raw).decode("ascii"),
+            mimeType=mime,
+        ),
+    ]
 
 
 # ========== 启动 ==========
