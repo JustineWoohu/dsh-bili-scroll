@@ -1217,7 +1217,8 @@ function reportMeta() {
    *    要读全就手工改这个列表（或者直接跑 mcp_server.py，不设这个变量 = 全放）。
    */
   const mcpWhitelist = () => {
-    const list = ['bili_search', 'bili_subtitle', 'bili_comments', 'bili_video_info']
+    const list = ['bili_search', 'bili_subtitle', 'bili_comments', 'bili_video_info',
+      'bili_cover', 'bili_frames']   // 看封面 / 画面帧：只读，不需要额外的闸
     // ⭐⭐ 2.0.4（第三方体检第 3 条）：**"只发私信"时评论通道必须硬关** —— 以前只看 autoComment，
     //    用户以前开过自动评论、后来切到"只私信"，那个 true 还在 config 里 ⇒ 评论工具照样下发 ✗
     const dmOnly = String(cfg.dmMode || '').trim() === 'only'
