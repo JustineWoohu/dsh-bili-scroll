@@ -36,6 +36,8 @@ import { loadCred as dmCred, listSessions as dmList, fetchMsgs as dmFetch } from
 import { ensureUv } from './lib/uvfetch.mjs'
 
 export const name = 'bili-scroll'
+// attachments / llm 故意**不**列进 inject：它们只在看图时才用 ctx.get 取，
+// 取不到就把图降级成文字说明；列进来会让没有这两个服务的宿主直接装不上。
 export const inject = ['webServer', 'tools', 'settings']
 
 /**

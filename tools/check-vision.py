@@ -55,6 +55,25 @@ check("{timestamp} 对象形状",
       [0.0, 5.0])
 check("空 index", S._snapshot_entries({}, 100.0), [])
 
+# ── _image_headers：图床请求绝不能带 Cookie ──────────────────
+h = S._image_headers()
+check("图床头没有 Cookie", [k.lower() for k in h], ["user-agent", "referer"])
+
+# ── _crop_tile：2×1 拼图，取第 1 块应该是右半边 ─────────────
+import io  # noqa: E402
+
+from PIL import Image  # noqa: E402
+
+sheet = Image.new("RGB", (960, 270), (255, 0, 0))
+sheet.paste(Image.new("RGB", (480, 270), (0, 0, 255)), (480, 0))
+buf = io.BytesIO()
+sheet.save(buf, format="PNG")
+tile = S._crop_tile(buf.getvalue(), 1, 480, 270)
+img = Image.open(io.BytesIO(tile)).convert("RGB")
+check("裁出来的尺寸", img.size, (480, 270))
+r, _g, b = img.getpixel((240, 135))
+check("取的是右半边（蓝色）", (r < 40 and b > 200), True)   # JPEG 有损，别比精确值
+
 if fail:
     print("❌ 失败：")
     for f in fail:
