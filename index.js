@@ -630,7 +630,18 @@ function reportMeta() {
         dmMode: cfg.dmMode,
         dmUid: Number(cfg.dmUid) || 0,
         transcribe: cfg.transcribe,
-        loggedIn: hasCredential(),
+        // ⭐ 2.0.4：认人改成"只认显式 UID / 登录账号自己"之后，**用小号登录、大号聊天**的人会静默失去私信回复 ✗
+      //    ⇒ 这里只给一条**提示**（不自动改！），界面上让他一键确认 —— 自动把"私信对象"当主人等于把安全修复撤销 ✗
+      dmOwnerHint: (() => {
+        try {
+          const own = Number(((() => { try { return dmCred(stateDir)?.dedeuserid } catch { return 0 } })())) || 0
+          const owner = Number(cfg.dmOwnerUid) || 0
+          const target = Number(cfg.dmUid) || 0
+          if (owner > 0 || target <= 0 || target === own) return null
+          return { uid: target, own }
+        } catch { return null }
+      })(),
+      loggedIn: hasCredential(),
         home: stateDir,
         report: join(outDir, `${dayKey(now)}.md`),
       }
