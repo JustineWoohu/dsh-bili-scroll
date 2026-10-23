@@ -1197,8 +1197,13 @@ async def bili_cover(bvid: str) -> list:
     import aiohttp
 
     cred = load_credential()          # 封面是公开的，没登录也取得到
-    v = video.Video(bvid=bvid, credential=cred)
-    info = await v.get_info()
+    try:
+        v = video.Video(bvid=bvid, credential=cred)   # 格式不对时**构造时就抛**
+        info = await v.get_info()
+    except Exception as e:
+        # ⚠️ 2026-10-23 实测两种失败：`62002 稿件不可见`（BV 不存在）
+        #    和 `ArgsException`（格式不对，构造时就抛）。都收成 ok:false。
+        return _text_only({"bvid": bvid, "ok": False, "error": f"取视频信息失败：{e}"})
 
     pic = str(info.get("pic") or "")
     if not pic:
@@ -1333,24 +1338,43 @@ async def bili_frames(bvid: str, num: int = 3, at: list | None = None) -> list:
         取不到会在说明里写明，不会静默少给。图能否被看见取决于模型是否支持图片输入。
     """
     cred = load_credential()          # 故事板不登录也能取；登录了只是更稳
-    v = video.Video(bvid=bvid, credential=cred)
-    info = await v.get_info()
+    try:
+        v = video.Video(bvid=bvid, credential=cred)   # 格式不对时**构造时就抛**
+        info = await v.get_info()
+    except Exception as e:
+        # 同 bili_cover：BV 不存在或格式不对，都收成 ok:false，别抛原始异常
+        return _text_only({"bvid": bvid, "ok": False, "error": f"取视频信息失败：{e}"})
     duration = float(info.get("duration") or 0)
     cid = info.get("cid") or ((info.get("pages") or [{}])[0].get("cid") or 0)
     if not cid:
         return _text_only({"bvid": bvid, "ok": False, "error": "拿不到 cid"})
 
-    try:
-        snap = await v.get_video_snapshot(cid=cid, json_index=True, pvideo=False)
-    except Exception as e:
-        return _text_only({"bvid": bvid, "ok": False, "error": f"取画面快照失败：{e}"})
+    # ⚠️ 2026-10-23 实测：这个故事板接口**会偶发返回空 index**（同一个视频、同样的参数，
+    #    有时 17 个切片、有时 0 个；连测 6 次又全是 17）。值班轮里就因为这一下，
+    #    模型把"这一瞬间拿了个空"写成了"这个视频没有故事板"。
+    #    ⇒ 空结果重试 3 次（间隔 1.2 秒），别把一次抖动当成"没有"。
+    snap = None
+    last_err = None
+    for attempt in range(3):
+        try:
+            snap = await v.get_video_snapshot(cid=cid, json_index=True, pvideo=False)
+            last_err = None
+        except Exception as e:
+            snap, last_err = None, e
+        if snap and (snap.get("index") or []) and (snap.get("image") or []):
+            break
+        if attempt < 2:
+            await asyncio.sleep(1.2)
+
+    if last_err is not None and not (snap or {}).get("index"):
+        return _text_only({"bvid": bvid, "ok": False, "error": f"取画面快照失败（重试 3 次）：{last_err}"})
 
     entries = _snapshot_entries(snap or {}, duration)
     sheets = (snap or {}).get("image") or []
     if not entries or not sheets:
         return _text_only({
             "bvid": bvid, "ok": False,
-            "error": "这个视频没有可用的画面快照（B站没给它生成故事板）",
+            "error": "取不到画面快照（重试 3 次都是空）—— B站可能没给这条生成故事板",
         })
 
     # 目标时间点：传了 at 就用它；否则按时长均分
