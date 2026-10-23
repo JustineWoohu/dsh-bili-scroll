@@ -599,11 +599,47 @@ function reportMeta() {
     schema: { type: 'object', properties: {}, additionalProperties: true },
     render: (_args, value) => {
       const src = value && typeof value === 'object' ? value : { value }
-      const { image, ...rest } = src
+      const { image, images, ...rest } = src
       const parts = [{ type: 'text', text: JSON.stringify(rest, null, 2) }]
-      if (image) parts.push({ type: 'image', attachment: image })
+      const refs = [...(image ? [image] : []), ...(Array.isArray(images) ? images : [])]
+      for (const ref of refs) parts.push({ type: 'image', attachment: ref })
       return parts
     },
+  }
+
+  /**
+   * 把 MCP 回来的图存成附件引用。返回 { ok, refs } 或 { ok:false, hint }。
+   *
+   * 两种失败都要说清楚，别让模型以为"这视频没图"：
+   *   · 宿主的 attachments 服务拿不到
+   *   · 当前模型没声明 image 输入
+   */
+  const attachImages = async (exec, images) => {
+    const attachments = ctx.get('attachments')
+    const llm = ctx.get('llm')
+    let canSee = false
+    try {
+      const routed = exec?.agent?.session?.requestHeader?.()?.config
+      const provider = routed?.provider ?? exec?.agent?.options?.provider
+      const model = routed?.model ?? exec?.agent?.options?.model
+      const info = await llm?.resolveModelInfo?.(provider, model, exec?.signal)
+      canSee = Boolean(info?.inputModalities?.includes('image'))
+    } catch { canSee = false }
+
+    if (!attachments?.saveImages) {
+      return { ok: false, hint: '宿主的图片服务不可用（ctx.get("attachments") 是空的），图没能附上' }
+    }
+    if (!canSee) {
+      return { ok: false, hint: '当前模型不支持图片输入，图没能附上 —— 换个支持看图的模型再试' }
+    }
+    try {
+      const refs = await attachments.saveImages(
+        images.map((i) => ({ data: Buffer.from(i.data, 'base64'), mediaType: i.mimeType })),
+      )
+      return { ok: true, refs }
+    } catch (e) {
+      return { ok: false, hint: '存图片失败：' + String(e?.message ?? e) }
+    }
   }
 
   tool({
@@ -619,34 +655,39 @@ function reportMeta() {
       const img = images[0]
       if (!img) return { ...meta, ok: false, error: 'MCP 没返回图片' }
 
-      const attachments = ctx.get('attachments')
-      const llm = ctx.get('llm')
-      let canSee = false
-      try {
-        const routed = exec?.agent?.session?.requestHeader?.()?.config
-        const provider = routed?.provider ?? exec?.agent?.options?.provider
-        const model = routed?.model ?? exec?.agent?.options?.model
-        const info = await llm?.resolveModelInfo?.(provider, model, exec?.signal)
-        canSee = Boolean(info?.inputModalities?.includes('image'))
-      } catch { canSee = false }
+      const a = await attachImages(exec, [img])
+      return a.ok
+        ? { ...meta, image_attached: true, image: a.refs[0] }
+        : { ...meta, image_attached: false, hint: a.hint }
+    },
+  })
 
-      if (!attachments?.saveImages || !canSee) {
-        return {
-          ...meta,
-          image_attached: false,
-          hint: canSee
-            ? '宿主的图片服务不可用，封面没能附上（只有文字）'
-            : '当前模型不支持图片输入，封面没能附上（只有文字）—— 换个支持看图的模型再试',
-        }
-      }
-      try {
-        const [ref] = await attachments.saveImages([
-          { data: Buffer.from(img.data, 'base64'), mediaType: img.mimeType },
-        ])
-        return { ...meta, image_attached: true, image: ref }
-      } catch (e) {
-        return { ...meta, image_attached: false, hint: '存图片失败：' + String(e?.message ?? e) }
-      }
+  tool({
+    name: 'bili_frames',
+    description: '看视频里的画面（从 B 站自带的故事板裁 1-6 帧，每帧 480×270）。\n'
+      + '想知道"这条视频到底拍了什么"就用它 —— 字幕告诉你说什么，画面告诉你拍的是什么。\n'
+      + '默认按时长均匀取 3 帧；想盯某个时刻（比如字幕里提到的那段）就传 at。',
+    parameters: {
+      bvid: { type: 'string', description: 'BV号' },
+      num: { type: 'number', description: '取几帧，1-6，默认 3' },
+      at: { type: 'array', items: { type: 'number' }, description: '指定时间点（秒）列表；传了就以它为准，忽略 num' },
+    },
+    output: imageOutput,
+    async execute(args, exec) {
+      const at = Array.isArray(args.at) ? args.at.map(Number).filter(Number.isFinite) : undefined
+      const { json, images } = await callRaw('bili_frames', {
+        bvid: String(args.bvid ?? ''),
+        num: Math.max(1, Math.min(Number(args.num) || 3, 6)),
+        ...(at && at.length ? { at } : {}),
+      })
+      const meta = json && typeof json === 'object' ? json : { raw: json }
+      if (!meta.ok) return meta
+      if (!images.length) return { ...meta, ok: false, error: 'MCP 没返回图片' }
+
+      const a = await attachImages(exec, images)
+      return a.ok
+        ? { ...meta, image_attached: true, images: a.refs }
+        : { ...meta, image_attached: false, hint: a.hint }
     },
   })
 
