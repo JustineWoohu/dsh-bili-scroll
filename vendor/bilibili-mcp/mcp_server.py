@@ -1140,28 +1140,19 @@ async def bili_received_at_and_likes() -> str:
 
 # ========== Tool 25: 看画面（封面） ==========
 #
-# ⭐ 2026-10-23 新增（上游没有）。三条设计口径：
-#   1. 图**直接作为 MCP image content 返回**，能不能进模型上下文由宿主判断 ——
-#      dsh-mcp-client 会校验模型是否声明 image 输入，不支持就把图降级成一行文本，不会崩。
-#      所以这里不做"先调视觉模型转文字"的绕路。
-#   2. 缩图**交给 B 站图片 CDN**（URL 后缀 `@512w.jpg`），不引 Pillow、不调 ffmpeg：
-#      实测 1920×1080 / 299KB 的原图 → 512×288 / 30KB，等比不裁切。
-#   3. **不落临时文件**：一张 30KB 直接读进内存转 base64，没有清理问题。
+# 图作为 MCP image content 返回，由宿主决定能否进模型上下文。
+# 缩图交给 B 站图片 CDN（URL 后缀 @512w.jpg），不引 Pillow、不落临时文件。
 
 _WEB_UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
 )
 _COVER_WIDTH = 512
-_MAX_IMAGE_BYTES = 1_500_000   # 超过就不给：宁可少一张图，也别把上下文塞爆
+_MAX_IMAGE_BYTES = 1_500_000
 
 
 def _cover_url(pic: str, width: int = _COVER_WIDTH) -> str:
-    """封面原图地址 → 带缩放后缀的 CDN 地址。
-
-    B 站图片 CDN 支持 `@<宽度>w.<格式>`：等比缩到指定宽度（实测 1920×1080 → 512×288）。
-    原地址可能已经带 @ 参数（如 @1c.png），先砍掉再拼，免得拼出两个 @。
-    """
+    """封面原图地址 → 带 CDN 缩放后缀（@<宽>w.jpg）的地址，等比不裁切。"""
     base = str(pic).split("@", 1)[0]
     if base.startswith("//"):
         base = "https:" + base
@@ -1249,31 +1240,17 @@ async def bili_cover(bvid: str) -> list:
 
 # ========== Tool 26: 看画面（画面帧） ==========
 #
-# 为什么不用 ffmpeg：它是外部二进制，用户机器上不一定有（本机实测就没有），
-# 而 B 站播放器进度条上那些小预览图本来就有接口。
-#
-# 实测（2026-10-22/23，热门榜连续取样）：
-#   · `x/player/videoshot` 匿名 6/6 可用；刚发布 0.0h 的视频 4/4 也有切片
-#   · 每块 480×270，拼图 4800×2700（10 列 × 10 行，一张最多 100 块）
-#   · 库里自带封装：`Video.get_video_snapshot(cid, json_index=True, pvideo=False)`
-#     ⚠️ `pvideo` 默认是 True，会走另一个老接口（/pvideo），必须显式传 False
-#   · `index` 有两种形状（同一批视频里都出现过）：int 数组 / 对象数组，都要容错
-#
-# 裁切用 Pillow —— 它已经跟着 requirements 里的 `qrcode[pil]` 装进同一个 venv 了，
-# 不算新增依赖。
+# 画面来自 B 站自带的故事板（x/player/videoshot），不解码视频、不用 ffmpeg。
+# Video.get_video_snapshot() 有封装，但 pvideo 默认 True 会走老接口，必须传 False。
+# 裁切用 Pillow（requirements 里的 qrcode[pil] 已经带进来）。
 
-_FRAME_MAX = 6          # 单次最多几帧：再多上下文和管道都吃不消
+_FRAME_MAX = 6
 _TILE_W_DEFAULT = 480
 _TILE_H_DEFAULT = 270
 
 
 def _snapshot_entries(data: dict, duration: float = 0.0) -> list:
-    """把 videoshot 的 index 归一成 [(秒, 块序号), ...]。
-
-    ⚠️ `index` 里数字的单位**不一定是毫秒**：实测 BV15ins67ERt（617 秒）给的是
-    `[0, 0, 5, 11, … 612]` —— 那就是**秒**；早期样本里又是毫秒。所以按量级判断：
-    最大值明显超过时长（1.5 倍以上）就当成毫秒，否则当秒。
-    """
+    """把 videoshot 的 index 归一成 [(秒, 块序号), ...]。"""
     raws = []
     for i, item in enumerate(data.get("index") or []):
         ts = item.get("timestamp") if isinstance(item, dict) else item
@@ -1291,14 +1268,7 @@ def _snapshot_entries(data: dict, duration: float = 0.0) -> list:
 
 
 async def _entries_from_pvdata(data: dict, cred) -> list:
-    """`index` 为空时的兜底：从 `pvdata` 那份二进制时间表里恢复切片时间。
-
-    实测（2026-10-23，三个视频逐一比对过）：`pvdata` 指向一个 .bin，
-    内容是**大端 uint16 的秒数数组**，跟 `index` 逐项相同。
-    例：120 秒视频 → 34 字节 → 17 项 → `[0, 0, 5, 10, 16, 24, …]`。
-
-    它比 `index` 稳：`index` 空的那几次，`pvdata` 照样有值。
-    """
+    """index 为空时的兜底：pvdata 指向一个大端 uint16 秒数数组，与 index 逐项相同。"""
     url = str(data.get("pvdata") or "")
     if not url:
         return []
@@ -1364,24 +1334,18 @@ async def bili_frames(bvid: str, num: int = 3, at: list | None = None) -> list:
         若干张 480×270 的画面 + 一句说明（时长、实际取到的那一刻、哪几帧失败）。
         取不到会在说明里写明，不会静默少给。图能否被看见取决于模型是否支持图片输入。
     """
-    cred = load_credential()          # 故事板不登录也能取；登录了只是更稳
+    cred = load_credential()          # 故事板不登录也能取
     try:
-        v = video.Video(bvid=bvid, credential=cred)   # 格式不对时**构造时就抛**
+        v = video.Video(bvid=bvid, credential=cred)
         info = await v.get_info()
     except Exception as e:
-        # 同 bili_cover：BV 不存在或格式不对，都收成 ok:false，别抛原始异常
         return _text_only({"bvid": bvid, "ok": False, "error": f"取视频信息失败：{e}"})
     duration = float(info.get("duration") or 0)
     cid = info.get("cid") or ((info.get("pages") or [{}])[0].get("cid") or 0)
     if not cid:
         return _text_only({"bvid": bvid, "ok": False, "error": "拿不到 cid"})
 
-    # ⚠️ 2026-10-23 实测：这个故事板接口**会偶发返回空 index** ——
-    #    HTTP 200、code=0、`image` 有，唯独 `index` 是空数组；15 次采样里空了 5 次（约 1/3），
-    #    跟并发无关（单发也会空），像是后端副本没同步。
-    #    值班轮里就因为这一下，模型把"这一瞬间拿了个空"写成了"这个视频没有故事板"。
-    #    ⇒ 三道防线：① 先读 `index`；② 空就用同响应里 `pvdata` 那份二进制时间表兜底；
-    #      ③ 两个都空才重试（最多 3 次）。
+    # index 会偶发返回空（实测约 1/3）：先用 pvdata 兜底，两个都空才重试
     snap = {}
     entries = []
     last_err = None

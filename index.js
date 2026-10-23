@@ -585,15 +585,9 @@ function reportMeta() {
   })
 
   /* ─────────────── 看画面：把图交给模型 ───────────────
-   *
-   * ⭐ 2026-10-23 新增。三条硬约束都是在 dsh 源码里核过的（不是猜的）：
-   *   1. 工具结果里的图片**不是** `image_url`，而是**附件引用** `{ type:'image', attachment }`；
-   *      字节要先存进 `ctx.get('attachments')`（服务名就叫 attachments，
-   *      参考第三方插件 dsh-codex-style-computer-use 的 lib/image-output.js）。
-   *   2. 模型不支持图片输入时不能硬塞：`ctx.get('llm').resolveModelInfo()` 查
-   *      `inputModalities`，不含 image 就退化成"文字 + 说明"。
-   *   3. `render` 才决定模型看到什么；`execute` 的返回值只能是纯数据，
-   *      所以附件引用随值返回、在 render 里拆出来（同 image-output.js 的写法）。
+   * 图片在工具结果里是附件引用 { type:'image', attachment }，不是 image_url；
+   * 字节先存进 ctx.get('attachments')，由 render 拼进返回内容。
+   * 模型不支持图片输入时退化成文字（查 llm.resolveModelInfo 的 inputModalities）。
    */
   const imageOutput = {
     schema: { type: 'object', properties: {}, additionalProperties: true },
@@ -607,13 +601,7 @@ function reportMeta() {
     },
   }
 
-  /**
-   * 把 MCP 回来的图存成附件引用。返回 { ok, refs } 或 { ok:false, hint }。
-   *
-   * 两种失败都要说清楚，别让模型以为"这视频没图"：
-   *   · 宿主的 attachments 服务拿不到
-   *   · 当前模型没声明 image 输入
-   */
+  /** 把 MCP 回来的图存成附件引用，返回 { ok, refs } 或 { ok:false, hint } */
   const attachImages = async (exec, images) => {
     const attachments = ctx.get('attachments')
     const llm = ctx.get('llm')
@@ -1217,6 +1205,7 @@ function reportMeta() {
    *    要读全就手工改这个列表（或者直接跑 mcp_server.py，不设这个变量 = 全放）。
    */
   const mcpWhitelist = () => {
+
     const list = ['bili_search', 'bili_subtitle', 'bili_comments', 'bili_video_info',
       'bili_cover', 'bili_frames']   // 看封面 / 画面帧：只读，不需要额外的闸
     // ⭐⭐ 2.0.4（第三方体检第 3 条）：**"只发私信"时评论通道必须硬关** —— 以前只看 autoComment，
