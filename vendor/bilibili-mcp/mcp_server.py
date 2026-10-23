@@ -14,7 +14,8 @@ B站数据采集 MCP 服务，支持 OpenClaw / Claude Code / Cursor / Cline
 #      ③ 登录成功后凭证**原子写**（先写 .tmp 再 os.replace）
 #      ④ `bili_comments` 把抓取异常带进返回（风控 -412 不再伪装成"这条视频 0 条评论"）
 #      ⑤ `bili_reply` 回执带上 `rpid` / `rpid_str` / `root` / `parent`（判重表与评论复核要用）
-#      ⑥ `bili_cover`：封面**作为图片**返回（上游没有；图能不能进模型上下文由宿主判断）
+#      ⑥ `bili_cover` / `bili_frames`：封面和画面帧**作为图片**返回（上游没有；
+#         图能不能进模型上下文由宿主判断）
 import asyncio
 import json
 import base64
@@ -1237,6 +1238,191 @@ async def bili_cover(bvid: str) -> list:
             data=base64.b64encode(raw).decode("ascii"),
             mimeType=mime,
         ),
+    ]
+
+
+# ========== Tool 26: 看画面（画面帧） ==========
+#
+# 为什么不用 ffmpeg：它是外部二进制，用户机器上不一定有（本机实测就没有），
+# 而 B 站播放器进度条上那些小预览图本来就有接口。
+#
+# 实测（2026-10-22/23，热门榜连续取样）：
+#   · `x/player/videoshot` 匿名 6/6 可用；刚发布 0.0h 的视频 4/4 也有切片
+#   · 每块 480×270，拼图 4800×2700（10 列 × 10 行，一张最多 100 块）
+#   · 库里自带封装：`Video.get_video_snapshot(cid, json_index=True, pvideo=False)`
+#     ⚠️ `pvideo` 默认是 True，会走另一个老接口（/pvideo），必须显式传 False
+#   · `index` 有两种形状（同一批视频里都出现过）：int 数组 / 对象数组，都要容错
+#
+# 裁切用 Pillow —— 它已经跟着 requirements 里的 `qrcode[pil]` 装进同一个 venv 了，
+# 不算新增依赖。
+
+_FRAME_MAX = 6          # 单次最多几帧：再多上下文和管道都吃不消
+_TILE_W_DEFAULT = 480
+_TILE_H_DEFAULT = 270
+
+
+def _snapshot_entries(data: dict, duration: float = 0.0) -> list:
+    """把 videoshot 的 index 归一成 [(秒, 块序号), ...]。
+
+    ⚠️ `index` 里数字的单位**不一定是毫秒**：实测 BV15ins67ERt（617 秒）给的是
+    `[0, 0, 5, 11, … 612]` —— 那就是**秒**；早期样本里又是毫秒。所以按量级判断：
+    最大值明显超过时长（1.5 倍以上）就当成毫秒，否则当秒。
+    """
+    raws = []
+    for i, item in enumerate(data.get("index") or []):
+        ts = item.get("timestamp") if isinstance(item, dict) else item
+        try:
+            raws.append((float(ts), i))
+        except (TypeError, ValueError):
+            continue
+    if not raws:
+        return []
+
+    biggest = max(v for v, _ in raws)
+    looks_ms = biggest > 10000 or (duration > 0 and biggest > duration * 1.5)
+    scale = 1000.0 if looks_ms else 1.0
+    return [(v / scale, i) for v, i in raws]
+
+
+async def _fetch_bytes(url: str, headers: dict) -> bytes:
+    import aiohttp
+
+    if url.startswith("//"):
+        url = "https:" + url
+    timeout = aiohttp.ClientTimeout(total=30)
+    async with aiohttp.ClientSession(timeout=timeout) as s:
+        async with s.get(url, headers=headers) as resp:
+            if resp.status != 200:
+                raise RuntimeError(f"HTTP {resp.status}")
+            return await resp.read()
+
+
+def _crop_tile(sheet: bytes, tile_index: int, tw: int, th: int) -> bytes:
+    """从拼图里裁出第 tile_index 块，返回 jpeg 字节。"""
+    import io
+
+    from PIL import Image
+
+    img = Image.open(io.BytesIO(sheet))
+    cols = max(1, img.width // tw)
+    rows = max(1, img.height // th)
+    if tile_index >= cols * rows:
+        raise RuntimeError(f"第 {tile_index} 块超出拼图（只有 {cols}×{rows}）")
+    col, row = tile_index % cols, tile_index // cols
+    tile = img.crop((col * tw, row * th, (col + 1) * tw, (row + 1) * th)).convert("RGB")
+    buf = io.BytesIO()
+    tile.save(buf, format="JPEG", quality=85)
+    return buf.getvalue()
+
+
+@tool()
+async def bili_frames(bvid: str, num: int = 3, at: list | None = None) -> list:
+    """
+    看这个视频里的画面（从 B 站自带的故事板里裁几帧）
+
+    想看"它到底拍了什么"就用它。默认按时长均匀取 3 帧；
+    想盯某个时刻（比如字幕里提到的那一段）就传 at（单位：秒），会取**最接近的那一块**。
+
+    Args:
+        bvid: 视频BV号，如"BV1uNk1YxEJQ"
+        num: 取几帧，1-6，默认 3
+        at: 指定时间点（秒）的列表；传了就以它为准，忽略 num
+
+    Returns:
+        若干张 480×270 的画面 + 一句说明（时长、实际取到的那一刻、哪几帧失败）。
+        取不到会在说明里写明，不会静默少给。图能否被看见取决于模型是否支持图片输入。
+    """
+    cred = load_credential()          # 故事板不登录也能取；登录了只是更稳
+    v = video.Video(bvid=bvid, credential=cred)
+    info = await v.get_info()
+    duration = float(info.get("duration") or 0)
+    cid = info.get("cid") or ((info.get("pages") or [{}])[0].get("cid") or 0)
+    if not cid:
+        return _text_only({"bvid": bvid, "ok": False, "error": "拿不到 cid"})
+
+    try:
+        snap = await v.get_video_snapshot(cid=cid, json_index=True, pvideo=False)
+    except Exception as e:
+        return _text_only({"bvid": bvid, "ok": False, "error": f"取画面快照失败：{e}"})
+
+    entries = _snapshot_entries(snap or {}, duration)
+    sheets = (snap or {}).get("image") or []
+    if not entries or not sheets:
+        return _text_only({
+            "bvid": bvid, "ok": False,
+            "error": "这个视频没有可用的画面快照（B站没给它生成故事板）",
+        })
+
+    # 目标时间点：传了 at 就用它；否则按时长均分
+    if at:
+        targets = [min(max(0.0, float(t)), max(0.0, duration - 0.1)) for t in at][:_FRAME_MAX]
+    else:
+        n = max(1, min(int(num or 3), _FRAME_MAX))
+        targets = [duration * (i + 1) / (n + 1) for i in range(n)]
+
+    picked = []
+    for t in targets:
+        ts, tile = min(entries, key=lambda e: abs(e[0] - t))
+        picked.append((round(t, 1), round(ts, 1), tile))
+
+    tw = int((snap or {}).get("img_x_size") or _TILE_W_DEFAULT)
+    th = int((snap or {}).get("img_y_size") or _TILE_H_DEFAULT)
+    headers = _image_cookie(cred)
+
+    cache = {}
+
+    async def get_sheet(no: int) -> bytes:
+        if no not in cache:
+            if no >= len(sheets):
+                raise RuntimeError(f"拼图 {no} 不存在（共 {len(sheets)} 张）")
+            cache[no] = await _fetch_bytes(str(sheets[no]), headers)
+        return cache[no]
+
+    # 每张拼图装几块要等第一张下来才知道（列数 = 宽 // 块宽）
+    blocks, frames, failed = [], [], []
+    cap = None
+    for i, (want, got, tile) in enumerate(picked):
+        try:
+            if cap is None:
+                first = await get_sheet(0)
+                import io
+
+                from PIL import Image
+
+                im = Image.open(io.BytesIO(first))
+                cap = max(1, (im.width // tw) * (im.height // th))
+            sheet_no, pos = tile // cap, tile % cap
+            raw = _crop_tile(await get_sheet(sheet_no), pos, tw, th)
+            if len(raw) > _MAX_IMAGE_BYTES:
+                raise RuntimeError(f"这一帧太大（{len(raw) // 1024}KB）")
+            blocks.append(ImageContent(
+                type="image",
+                data=base64.b64encode(raw).decode("ascii"),
+                mimeType="image/jpeg",
+            ))
+            frames.append({"index": i, "want_sec": want, "got_sec": got,
+                           "kb": round(len(raw) / 1024, 1)})
+        except Exception as e:
+            failed.append({"index": i, "want_sec": want, "got_sec": got, "reason": str(e)})
+
+    if not blocks:
+        return _text_only({
+            "bvid": bvid, "ok": False,
+            "error": "一帧都没取到", "failed": failed,
+        })
+
+    return [
+        TextContent(type="text", text=json.dumps({
+            "bvid": bvid,
+            "ok": True,
+            "title": info.get("title"),
+            "duration": duration,
+            "tile": f"{tw}x{th}",
+            "frames": frames,
+            "failed": failed,        # 空列表 = 全成
+            "note": "want_sec 是想要的时刻，got_sec 是实际取到的那一块（故事板是按固定间隔切的）",
+        }, ensure_ascii=False)),
+        *blocks,
     ]
 
 
