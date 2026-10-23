@@ -249,7 +249,6 @@ function WatchTab() {
       const [replyPer, setReplyPer] = React.useState(null)
       const [dmUid, setDmUid] = React.useState(null)        // 私信收件人 UID（本地草稿）
       const [dmWatch, setDmWatch] = React.useState(null)          // 私信双向开关
-  const [dmOwner, setDmOwner] = React.useState(null)          // 「只回谁的私信」= 我自己的 UID
       const [dmMode, setDmMode] = React.useState(null)      // 投递方式：off / only / both
       const [mention, setMention] = React.useState(null)
       const [login, setLogin] = React.useState(null)
@@ -287,7 +286,6 @@ function WatchTab() {
         if (cfg && dmUid === null) setDmUid(cfg.dmUid ? String(cfg.dmUid) : '')
         if (cfg && dmMode === null) setDmMode(cfg.dmMode || 'only')
         if (cfg && dmWatch === null) setDmWatch(cfg.dmWatch !== false)   // 2.0 起默认开
-  if (cfg && dmOwner === null) setDmOwner(cfg.dmOwnerUid ? String(cfg.dmOwnerUid) : '')
         if (cfg && favId === null) setFavId(String(cfg.favFolderId ?? 0))
       }, [cfg])
 
@@ -648,27 +646,13 @@ function WatchTab() {
             on: Boolean(dmWatch),
             onChange: (v) => { setDmWatch(v); patch({ dmWatch: v }, '私信双向') },
           }),
-          (st.dmOwnerHint && !Number(dmOwner)) ? h('div', { 'data-bd-note': '' },
-            '⚠️ 你现在登录的是另一个号：私信对象是 ' + st.dmOwnerHint.uid + '，但「只回谁的私信」是空的',
-            h('br'),
-            '如果你就是用那个号跟它聊，点右边一下就好：',
-            h('button', {
-              'data-bd-btn': '', style: { marginLeft: '8px' },
-              onClick: () => { setDmOwner(String(st.dmOwnerHint.uid)); patch({ dmOwnerUid: st.dmOwnerHint.uid }, '只回谁的私信') },
-            }, '就按 ' + st.dmOwnerHint.uid + ' 来')) : null,
-          dmWatch ? h('div', { 'data-bd-sub': '' },
-            h('div', { 'data-bd-row': '' },
-              h('div', { 'data-bd-label': '' }, '只回谁的私信（我自己的 B站 UID）'),
-              h('input', {
-                'data-bd-input': '', style: { width: '160px' }, placeholder: '留空 = 登录的这个账号',
-                value: dmOwner ?? '',
-                onChange: (e) => setDmOwner(e.target.value.replace(/\D/g, '')),
-                onBlur: () => patch({ dmOwnerUid: Math.max(0, Number(dmOwner) || 0) }, '只回谁的私信'),
-              })),
-            h('div', { 'data-bd-note': '' },
-              '⚠️ 只回这个人的私信，别人的一律不回。留空 = 只回"你现在登录的那个号"自己。',
-              h('br'),
-              '（如果你用小号登录、用大号跟它聊，这里要填大号的 UID；填 UID 而不是昵称，免得认错人）')) : null,
+          // ⭐ 2026-10-23：**不加新输入框**，只把"它认谁当主人"显示出来 —— 填错当场看得见 ✓
+          (st.ownerInfo && dmWatch) ? h('div', { 'data-bd-note': '' },
+            '它会认这个人当主人：',
+            (st.ownerInfo.name ? st.ownerInfo.name + ' · ' : ''),
+            'uid ' + st.ownerInfo.uid,
+            st.ownerInfo.self ? '（就是现在登录的这个号）' : '',
+            ' —— 想换人，改上面那个「要 @ 谁」就行') : null,
           h(ToggleRow, {
             label: '本地转写没字幕的视频',
             note: '默认关；开了以后，没字幕的视频会在本机转写一遍（不花 API 钱）',

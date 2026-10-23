@@ -632,15 +632,7 @@ function reportMeta() {
         transcribe: cfg.transcribe,
         // ⭐ 2.0.4：认人改成"只认显式 UID / 登录账号自己"之后，**用小号登录、大号聊天**的人会静默失去私信回复 ✗
       //    ⇒ 这里只给一条**提示**（不自动改！），界面上让他一键确认 —— 自动把"私信对象"当主人等于把安全修复撤销 ✗
-      dmOwnerHint: (() => {
-        try {
-          const own = Number(((() => { try { return dmCred(stateDir)?.dedeuserid } catch { return 0 } })())) || 0
-          const owner = Number(cfg.dmOwnerUid) || 0
-          const target = Number(cfg.dmUid) || 0
-          if (owner > 0 || target <= 0 || target === own) return null
-          return { uid: target, own }
-        } catch { return null }
-      })(),
+      ownerInfo: ownerInfo(),
       loggedIn: hasCredential(),
         home: stateDir,
         report: join(outDir, `${dayKey(now)}.md`),
@@ -1376,22 +1368,40 @@ function reportMeta() {
   const dmQuotaFile = join(stateDir, 'dm-quota.json')
   const readJsonFile = (f, dflt) => { try { return JSON.parse(readFileSync(f, 'utf8')) } catch { return dflt } }
   const writeJsonFile = (f, obj) => { try { writeFileSync(f, JSON.stringify(obj, null, 2), 'utf8') } catch { /* 写不进去就下次再说 */ } }
-  // ⭐⭐ 2026-10-23 安全修复（有用户报"它会把别人当成主人"，核实为真 ✗）：
-  //    以前这里会退到 cfg.dmUid（"私信发给谁"，可能是个 UP 主/陌生人）和
-  //    mentionName 昵称解析出来的 uid（"@ 谁"，也可能填的是别人）——
-  //    ⚠️ 一旦那两个填的不是用户自己，**那个陌生人的私信就会被当成"主人发来的"**，
-  //    然后插件还会用用户的号回他 ⇒ 既骚扰别人，也可能被诱导说出配置。
-  //    ⇒ 现在只认两个来源，且都指向"用户自己"：
-  //      ① 用户在设置里**明确填的**「我的 B站 UID」
-  //      ② 登录的这个账号自己的 uid（凭证里的 dedeuserid）——用自己号登录时的安全默认
+  // ⭐ 2026-10-23（经主人拍板，回退我先前那版"加一个新字段"的做法）：
+  //    **「@ 谁 / 私信给谁」那个框就是"我"** —— 它的本意就是"让它 @ 我"。
+  //    判据按这个顺序：显式 UID → 那个框填的 UID → 那个昵称解析出来的 UID → 登录账号自己。
+  //    ⚠️ 用户如果**自己**把那个框填成别人又开了私信，那是他的配置选择（不是我们要兜的系统洞）；
+  //       我们能做的是**把"它认谁当主人"显示出来**，填错当场看得见 ✓
   const dmOwnerUid = () => {
-    const explicit = Number(cfg.dmOwnerUid)
-    if (explicit > 0) return explicit
+    const direct = Number(cfg.dmUid) || dmUidCache
+    if (direct > 0) return direct
+    try {
+      const cache = JSON.parse(readFileSync(join(stateDir, 'uid-cache.json'), 'utf8')) || {}
+      const name = String(cfg.mentionName || '').trim()
+      if (name && Number(cache[name]) > 0) return Number(cache[name])
+    } catch { /* 没有缓存就算了 */ }
     try {
       const own = Number(dmCred(stateDir)?.dedeuserid) || 0
       if (own > 0) return own
     } catch { /* 没凭证就 0 */ }
     return 0
+  }
+
+  /** 界面上"它会认谁当主人"那一行用的信息 */
+  const ownerInfo = () => {
+    try {
+      const uid = dmOwnerUid()
+      if (!uid) return null
+      let name = ''
+      try {
+        const cache = JSON.parse(readFileSync(join(stateDir, 'uid-cache.json'), 'utf8')) || {}
+        for (const [k, v] of Object.entries(cache)) if (Number(v) === uid) { name = k; break }
+      } catch { /* 没缓存就只显示 uid */ }
+      if (!name && String(cfg.mentionName || '').trim() && Number(cfg.dmUid) === uid) name = String(cfg.mentionName).trim()
+      const own = Number(((() => { try { return dmCred(stateDir)?.dedeuserid } catch { return 0 } })())) || 0
+      return { uid, name, self: uid === own }
+    } catch { return null }
   }
 
   function dmPromptFor(fromUid, text) {
