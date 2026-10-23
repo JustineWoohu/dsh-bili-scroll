@@ -856,6 +856,22 @@ function reportMeta() {
   // ⭐ 2026-10-19：以前找不到 dsh 就退到裸 `dsh` 硬跑 ⇒ 必然 spawn 失败、只留 exit 1 + 乱码。
   //    现在先看 PATH 里到底有没有它：**没有就明确返回 missing**（调用方会停下来说清楚），
   //    有才允许"最后一招"（有些人是手动配过 PATH 的 npm 全局）✓
+  // ⭐ 2026-10-23 安全加固（审计点名第一条）：**绝不把提示词交给 shell 执行** ✗
+  //    以前找不到 dsh 就返回 { shell: true } 并把 prompt 当参数传进去 ⇒ cmd.exe 会解析 & | ^ 等符号
+  //    ⇒ 配置里的关键词/路径一带这些字符，就是**命令注入面**。改成在 PATH 里解析出绝对路径、shell:false ✓
+  const findOnPath = (names) => {
+    const dirs = String(process.env.PATH || '').split(process.platform === 'win32' ? ';' : ':')
+    for (const d of dirs) {
+      const dir = d.replace(/^"|"$/g, "").trim()
+      if (!dir) continue
+      for (const n of names) {
+        const p = join(dir, n)
+        try { if (existsSync(p)) return p } catch { /* 坏路径跳过 */ }
+      }
+    }
+    return ''
+  }
+
   const hasDshOnPath = () => {
     const exts = process.platform === 'win32' ? ['', '.cmd', '.exe', '.bat', '.ps1'] : ['']
     const dirs = String(process.env.PATH || '').split(process.platform === 'win32' ? ';' : ':')
@@ -899,8 +915,14 @@ function reportMeta() {
       log('⚠️ 找不到 dsh（常见位置、应用目录、PATH 里都没有）⇒ ' + hint)
       return { missing: true, hint }
     }
-    log('⚠️ 没在常见位置找到 dsh，最后试一下 PATH 里的 `dsh` ⇒ ' + hint)
-    return { command: 'dsh', args: [], shell: true, fallback: true, hint }
+    // ⭐ 安全加固：在 PATH 里解析成绝对路径再用（shell:false）—— 绝不 shell:true 拼字符串 ✗
+    const onPath = findOnPath(process.platform === 'win32' ? ['dsh.cmd', 'dsh.exe', 'dsh.bat', 'dsh'] : ['dsh'])
+    if (onPath) {
+      log('⚠️ 没在常见位置找到 dsh，改用 PATH 里那份（绝对路径、不经 shell）：' + onPath)
+      return { command: onPath, args: [], shell: false, fallback: true, hint }
+    }
+    log('⚠️ 找不到 dsh（常见位置、应用目录、PATH 里都没有）⇒ ' + hint)
+    return { missing: true, hint }
   }
 
   // ⭐ 私信默认化（2026-10-21）：用户常常只填了「@ 谁」的昵称、没填 UID
@@ -1081,6 +1103,9 @@ function reportMeta() {
     const file = join(stateDir, 'headless-overlay.yml')
     const script = join(stateDir, 'mcp_server.py')
     const posix = (p) => String(p).replace(/\\/g, '/')
+  // ⭐ 2026-10-23 安全加固（审计点名）：**路径要按 YAML 单引号规则转义** ——
+  //    以前直接把路径塞进单引号里，路径带单引号就会把 overlay 拼坏（甚至多出键）✗
+  const yq = (v) => "'" + String(v).replace(/'/g, "''") + "'"
     const yml = []
     // ⭐⭐ 2026-10-18（用户 `Elec-Tron-lc` 递来完整报告，逐条核过）：
     //    DSH **0.2.1-rc.2** 的 `@deepseek-ai/dsh-headless` 自带 patch 把三个服务 `disabled: true` 了 ——
@@ -1121,11 +1146,11 @@ function reportMeta() {
         '      config:',
         '        serverName: bili-duty',
         '        transport: stdio',
-        `        command: '${posix(cfg.pythonPath || 'python')}'`,
+        '        command: ' + yq(posix(cfg.pythonPath || 'python')),
         '        args:',
-        `          - '${posix(script)}'`,
+        '          - ' + yq(posix(script)),
         '        env:',
-        `          BILI_MCP_TOOLS: '${mcpWhitelist().join(',')}'`,
+        '          BILI_MCP_TOOLS: ' + yq(mcpWhitelist().join(',')),
         '',
       )
     }
@@ -2415,10 +2440,29 @@ function reportMeta() {
   }
 
   try {
+  const sameOriginOk = (req) => {
+    try {
+      const host = String(req.headers.host || '')
+      if (!host) return true   // 没有 Host 头 = 不是浏览器/不是外来的 HTTP 请求
+      if (!/^(127\.0\.0\.1|localhost|\[::1\])(:\d+)?$/i.test(host)) return false
+      const pick = String(req.headers.origin || req.headers.referer || '')
+      if (!pick) return true   // 不是浏览器发的（本机脚本/宿主内部）—— 本机进程本来就有权限
+      try {
+        const u = new URL(pick)
+        return /^(127\.0\.0\.1|localhost|\[::1\])$/i.test(u.hostname)
+      } catch { return false }
+    } catch { return false }
+  }
     ctx.effect(() => ctx.webServer.register({
       kind: 'prefix',
       path: '/api/bili-duty',
+  // ⭐ 2026-10-23 安全加固（审计点名"未鉴权的控制接口"）：**只接受本机同源请求** ——
+  //    别的网页在你浏览器里也能打到 127.0.0.1，所以要比对 Host 与本机、Origin/Referer 与同源 ✓
       handler: async (req, res) => {
+    if (!sameOriginOk(req)) {
+      try { sendJson(res, 403, { ok: false, error: '只接受本机同源请求' }) } catch { /* 忽略 */ }
+      return
+    }
         try { await handle(req, res, new URL(req.url, 'http://127.0.0.1')) } catch (e) {
           sendJson(res, 500, { ok: false, error: e?.message ?? String(e) })
         }
