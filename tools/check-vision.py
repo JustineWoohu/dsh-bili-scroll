@@ -57,7 +57,7 @@ check("空 index", S._snapshot_entries({}, 100.0), [])
 
 # ── _image_headers：图床请求绝不能带 Cookie ──────────────────
 h = S._image_headers()
-check("图床头没有 Cookie", [k.lower() for k in h], ["user-agent", "referer"])
+check("图床头只有 UA + Referer", sorted(k.lower() for k in h), ["referer", "user-agent"])
 
 # ── _crop_tile：2×1 拼图，取第 1 块应该是右半边 ─────────────
 import io  # noqa: E402
