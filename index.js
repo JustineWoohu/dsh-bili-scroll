@@ -640,7 +640,7 @@ function reportMeta() {
     parameters: { bvid: { type: 'string', description: 'BV号' } },
     output: imageOutput,
     async execute(args, exec) {
-      const { json, images } = await callRaw('bili_cover', { bvid: String(args.bvid ?? '') })
+      const { json, images } = await callRaw('bili_cover', { bvid: String(args.bvid ?? '') }, { signal: exec?.signal })
       const meta = json && typeof json === 'object' ? json : { raw: json }
       if (!meta.ok) return meta
       const img = images[0]
@@ -670,7 +670,7 @@ function reportMeta() {
         bvid: String(args.bvid ?? ''),
         num: Math.max(1, Math.min(Number(args.num) || 3, 6)),
         ...(at && at.length ? { at } : {}),
-      })
+      }, { signal: exec?.signal })
       const meta = json && typeof json === 'object' ? json : { raw: json }
       if (!meta.ok) return meta
       if (!images.length) return { ...meta, ok: false, error: 'MCP 没返回图片' }

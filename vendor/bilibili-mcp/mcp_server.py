@@ -1148,6 +1148,8 @@ _WEB_UA = (
     "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
 )
 _COVER_WIDTH = 512
+_HTTP_TIMEOUT = 25               # 图床 / 快照下载统一超时（秒）
+# 防御性上限：实测封面 23–36KB、帧 2.6–29KB，正常走不到这一行
 _MAX_IMAGE_BYTES = 1_500_000
 
 
@@ -1211,7 +1213,7 @@ async def bili_cover(bvid: str) -> list:
 
     url = _cover_url(pic)
     try:
-        timeout = aiohttp.ClientTimeout(total=25)
+        timeout = aiohttp.ClientTimeout(total=_HTTP_TIMEOUT)
         async with aiohttp.ClientSession(timeout=timeout) as s:
             async with s.get(url, headers=_image_headers()) as resp:
                 if resp.status != 200:
@@ -1300,7 +1302,7 @@ async def _entries_from_pvdata(data: dict) -> list:
 async def _fetch_bytes(url: str, headers: dict) -> bytes:
     import aiohttp
 
-    timeout = aiohttp.ClientTimeout(total=30)
+    timeout = aiohttp.ClientTimeout(total=_HTTP_TIMEOUT)
     async with aiohttp.ClientSession(timeout=timeout) as s:
         async with s.get(_https(url), headers=headers) as resp:
             if resp.status != 200:
@@ -1364,7 +1366,7 @@ async def bili_frames(bvid: str, num: int = 3, at: list | None = None) -> list:
     snap = {}
     entries = []
     last_err = None
-    for attempt in range(3):
+    for attempt in range(2):
         try:
             snap = await v.get_video_snapshot(cid=cid, json_index=True, pvideo=False) or {}
             last_err = None
@@ -1375,15 +1377,15 @@ async def bili_frames(bvid: str, num: int = 3, at: list | None = None) -> list:
             entries = await _entries_from_pvdata(snap)
         if entries and (snap.get("image") or []):
             break
-        if attempt < 2:
-            await asyncio.sleep(1.2)
+        if attempt < 1:
+            await asyncio.sleep(1.0)
 
     sheets = snap.get("image") or []
     if not entries or not sheets:
         err = f"（最后一次错误：{last_err}）" if last_err is not None else ""
         return _text_only({
             "bvid": bvid, "ok": False,
-            "error": f"取不到画面快照（试了 3 次）{err}",
+            "error": f"取不到画面快照（试了 2 次）{err}",
         })
 
     # 目标时间点：传了 at 就用它；否则按"覆盖长度"均分
