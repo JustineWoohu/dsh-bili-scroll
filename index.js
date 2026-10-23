@@ -525,12 +525,7 @@ function reportMeta() {
   const tool = (spec) => ctx.tools.register(defineTool({
     ...spec,
     output: spec.output || textOutput,
-    async execute(args, exec) {
-      const v = await spec.execute(args, exec)
-      // ⭐ 自带 output 的工具（比如要返回图片的）不过 safe()：附件引用被 JSON 往返复制成一个
-      //    新对象之后就不再是"那个"引用了。这类工具自己保证值是能序列化的纯数据。
-      return spec.output ? v : safe(v)
-    },
+    async execute(args, exec) { return safe(await spec.execute(args, exec)) },
   }))
 
   tool({

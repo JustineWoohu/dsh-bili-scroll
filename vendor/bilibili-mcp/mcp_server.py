@@ -1151,21 +1151,29 @@ _COVER_WIDTH = 512
 _MAX_IMAGE_BYTES = 1_500_000
 
 
+def _https(url: str) -> str:
+    """把 B 站的图片/资源地址统一成 https。
+
+    view 接口给的 `pic` 实测 10/10 都是 `http://`，而 http 不会跳转 https；
+    图床请求再带上 SESSDATA 就等于把登录凭据明文发出去。
+    """
+    u = str(url or "")
+    if u.startswith("//"):
+        return "https:" + u
+    if u.startswith("http://"):
+        return "https://" + u[len("http://"):]
+    return u
+
+
 def _cover_url(pic: str, width: int = _COVER_WIDTH) -> str:
     """封面原图地址 → 带 CDN 缩放后缀（@<宽>w.jpg）的地址，等比不裁切。"""
-    base = str(pic).split("@", 1)[0]
-    if base.startswith("//"):
-        base = "https:" + base
+    base = _https(str(pic).split("@", 1)[0])
     return f"{base}@{width}w.jpg"
 
 
-def _image_cookie(cred) -> dict:
-    h = {"User-Agent": _WEB_UA, "Referer": "https://www.bilibili.com/"}
-    if cred:
-        h["Cookie"] = (
-            f"SESSDATA={cred.sessdata}; bili_jct={cred.bili_jct}; buvid3={cred.buvid3 or ''}"
-        )
-    return h
+def _image_headers() -> dict:
+    """图床请求头：只给 UA + Referer，**不带 Cookie**（图床不需要登录态）。"""
+    return {"User-Agent": _WEB_UA, "Referer": "https://www.bilibili.com/"}
 
 
 def _text_only(payload: dict) -> list:
@@ -1205,7 +1213,7 @@ async def bili_cover(bvid: str) -> list:
     try:
         timeout = aiohttp.ClientTimeout(total=25)
         async with aiohttp.ClientSession(timeout=timeout) as s:
-            async with s.get(url, headers=_image_cookie(cred)) as resp:
+            async with s.get(url, headers=_image_headers()) as resp:
                 if resp.status != 200:
                     raise RuntimeError(f"HTTP {resp.status}")
                 raw = await resp.read()
@@ -1250,7 +1258,12 @@ _TILE_H_DEFAULT = 270
 
 
 def _snapshot_entries(data: dict, duration: float = 0.0) -> list:
-    """把 videoshot 的 index 归一成 [(秒, 块序号), ...]。"""
+    """把 videoshot 的 index 归一成 [(秒, 块序号), ...]。
+
+    时间单位实测两种都出现过（秒 / 毫秒），只能靠和时长比较来判断：
+    超过时长 1.5 倍才当毫秒。⚠️ 别再加"绝对值大于某个数就当毫秒"这类判据 ——
+    6 小时视频的秒数（22163）会被误判成毫秒，三帧全塌到同一块、时间缩小 1000 倍。
+    """
     raws = []
     for i, item in enumerate(data.get("index") or []):
         ts = item.get("timestamp") if isinstance(item, dict) else item
@@ -1262,20 +1275,18 @@ def _snapshot_entries(data: dict, duration: float = 0.0) -> list:
         return []
 
     biggest = max(v for v, _ in raws)
-    looks_ms = biggest > 10000 or (duration > 0 and biggest > duration * 1.5)
+    looks_ms = duration > 0 and biggest > duration * 1.5
     scale = 1000.0 if looks_ms else 1.0
     return [(v / scale, i) for v, i in raws]
 
 
-async def _entries_from_pvdata(data: dict, cred) -> list:
+async def _entries_from_pvdata(data: dict) -> list:
     """index 为空时的兜底：pvdata 指向一个大端 uint16 秒数数组，与 index 逐项相同。"""
-    url = str(data.get("pvdata") or "")
+    url = _https(data.get("pvdata") or "")
     if not url:
         return []
-    if url.startswith("//"):
-        url = "https:" + url
     try:
-        raw = await _fetch_bytes(url, _image_cookie(cred))
+        raw = await _fetch_bytes(url, _image_headers())
     except Exception:
         return []
     if not raw or len(raw) % 2:
@@ -1289,11 +1300,9 @@ async def _entries_from_pvdata(data: dict, cred) -> list:
 async def _fetch_bytes(url: str, headers: dict) -> bytes:
     import aiohttp
 
-    if url.startswith("//"):
-        url = "https:" + url
     timeout = aiohttp.ClientTimeout(total=30)
     async with aiohttp.ClientSession(timeout=timeout) as s:
-        async with s.get(url, headers=headers) as resp:
+        async with s.get(_https(url), headers=headers) as resp:
             if resp.status != 200:
                 raise RuntimeError(f"HTTP {resp.status}")
             return await resp.read()
@@ -1332,7 +1341,8 @@ async def bili_frames(bvid: str, num: int = 3, at: list | None = None) -> list:
 
     Returns:
         若干张 480×270 的画面 + 一句说明（时长、实际取到的那一刻、哪几帧失败）。
-        取不到会在说明里写明，不会静默少给。图能否被看见取决于模型是否支持图片输入。
+        失败会写进 failed。**多P 视频的故事板通常只覆盖第 1P**，返回里会用
+        covered_sec / pages 标明实际覆盖范围。图能否被看见取决于模型是否支持图片输入。
     """
     cred = load_credential()          # 故事板不登录也能取
     try:
@@ -1341,11 +1351,16 @@ async def bili_frames(bvid: str, num: int = 3, at: list | None = None) -> list:
     except Exception as e:
         return _text_only({"bvid": bvid, "ok": False, "error": f"取视频信息失败：{e}"})
     duration = float(info.get("duration") or 0)
-    cid = info.get("cid") or ((info.get("pages") or [{}])[0].get("cid") or 0)
+    pages = info.get("pages") or []
+    cid = info.get("cid") or ((pages or [{}])[0].get("cid") or 0)
     if not cid:
         return _text_only({"bvid": bvid, "ok": False, "error": "拿不到 cid"})
 
-    # index 会偶发返回空（实测约 1/3）：先用 pvdata 兜底，两个都空才重试
+    # 故事板只覆盖第 1P：目标时间点按"实际覆盖的长度"算，别落到没采样的 P2 上
+    covered = float(pages[0].get("duration") or duration) if pages else duration
+    covered = covered or duration
+
+    # index 会偶发返回空（实测约 25%）：先用 pvdata 兜底，两个都空才重试
     snap = {}
     entries = []
     last_err = None
@@ -1355,9 +1370,9 @@ async def bili_frames(bvid: str, num: int = 3, at: list | None = None) -> list:
             last_err = None
         except Exception as e:
             snap, last_err = {}, e
-        entries = _snapshot_entries(snap, duration)
+        entries = _snapshot_entries(snap, covered)
         if not entries:
-            entries = await _entries_from_pvdata(snap, cred)
+            entries = await _entries_from_pvdata(snap)
         if entries and (snap.get("image") or []):
             break
         if attempt < 2:
@@ -1368,24 +1383,24 @@ async def bili_frames(bvid: str, num: int = 3, at: list | None = None) -> list:
         err = f"（最后一次错误：{last_err}）" if last_err is not None else ""
         return _text_only({
             "bvid": bvid, "ok": False,
-            "error": f"取不到画面快照（index 与 pvdata 都空，试了 3 次）{err}",
+            "error": f"取不到画面快照（试了 3 次）{err}",
         })
 
-    # 目标时间点：传了 at 就用它；否则按时长均分
+    # 目标时间点：传了 at 就用它；否则按"覆盖长度"均分
     if at:
-        targets = [min(max(0.0, float(t)), max(0.0, duration - 0.1)) for t in at][:_FRAME_MAX]
+        targets = [min(max(0.0, float(t)), max(0.0, covered - 0.1)) for t in at][:_FRAME_MAX]
     else:
         n = max(1, min(int(num or 3), _FRAME_MAX))
-        targets = [duration * (i + 1) / (n + 1) for i in range(n)]
+        targets = [covered * (i + 1) / (n + 1) for i in range(n)]
 
     picked = []
     for t in targets:
         ts, tile = min(entries, key=lambda e: abs(e[0] - t))
         picked.append((round(t, 1), round(ts, 1), tile))
 
-    tw = int((snap or {}).get("img_x_size") or _TILE_W_DEFAULT)
-    th = int((snap or {}).get("img_y_size") or _TILE_H_DEFAULT)
-    headers = _image_cookie(cred)
+    tw = int(snap.get("img_x_size") or _TILE_W_DEFAULT)
+    th = int(snap.get("img_y_size") or _TILE_H_DEFAULT)
+    headers = _image_headers()
 
     cache = {}
 
@@ -1435,10 +1450,13 @@ async def bili_frames(bvid: str, num: int = 3, at: list | None = None) -> list:
             "ok": True,
             "title": info.get("title"),
             "duration": duration,
+            "covered_sec": round(covered, 1),
+            "pages": max(1, len(pages)),
             "tile": f"{tw}x{th}",
             "frames": frames,
             "failed": failed,        # 空列表 = 全成
-            "note": "want_sec 是想要的时刻，got_sec 是实际取到的那一块（故事板是按固定间隔切的）",
+            "note": "want_sec 是想要的时刻，got_sec 是实际取到的那一块（故事板按固定间隔切）；"
+                    "多P 视频只覆盖第 1P，看 covered_sec",
         }, ensure_ascii=False)),
         *blocks,
     ]
