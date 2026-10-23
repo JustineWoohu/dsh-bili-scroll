@@ -495,6 +495,12 @@ function reportMeta() {
     return client.call(toolName, args, opts)
   }
 
+  /** 同 call，但保留 MCP 返回里的图片块（封面/画面要用）—— 见 lib/mcp.mjs 的 callRaw */
+  const callRaw = async (toolName, args, opts) => {
+    const client = await ensureMcp()
+    return client.callRaw(toolName, args, opts)
+  }
+
   const hasCredential = () => existsSync(join(stateDir, 'bili_credential.json'))
 
   /* ─────────────── 工具 ─────────────── */
@@ -518,8 +524,13 @@ function reportMeta() {
 
   const tool = (spec) => ctx.tools.register(defineTool({
     ...spec,
-    output: textOutput,
-    async execute(args, exec) { return safe(await spec.execute(args, exec)) },
+    output: spec.output || textOutput,
+    async execute(args, exec) {
+      const v = await spec.execute(args, exec)
+      // ⭐ 自带 output 的工具（比如要返回图片的）不过 safe()：附件引用被 JSON 往返复制成一个
+      //    新对象之后就不再是"那个"引用了。这类工具自己保证值是能序列化的纯数据。
+      return spec.output ? v : safe(v)
+    },
   }))
 
   tool({
@@ -570,6 +581,72 @@ function reportMeta() {
     },
     async execute(args) {
       return call('bili_comments', { bvid: String(args.bvid ?? ''), num: Math.max(1, Number(args.num) || 30) })
+    },
+  })
+
+  /* ─────────────── 看画面：把图交给模型 ───────────────
+   *
+   * ⭐ 2026-10-23 新增。三条硬约束都是在 dsh 源码里核过的（不是猜的）：
+   *   1. 工具结果里的图片**不是** `image_url`，而是**附件引用** `{ type:'image', attachment }`；
+   *      字节要先存进 `ctx.get('attachments')`（服务名就叫 attachments，
+   *      参考第三方插件 dsh-codex-style-computer-use 的 lib/image-output.js）。
+   *   2. 模型不支持图片输入时不能硬塞：`ctx.get('llm').resolveModelInfo()` 查
+   *      `inputModalities`，不含 image 就退化成"文字 + 说明"。
+   *   3. `render` 才决定模型看到什么；`execute` 的返回值只能是纯数据，
+   *      所以附件引用随值返回、在 render 里拆出来（同 image-output.js 的写法）。
+   */
+  const imageOutput = {
+    schema: { type: 'object', properties: {}, additionalProperties: true },
+    render: (_args, value) => {
+      const src = value && typeof value === 'object' ? value : { value }
+      const { image, ...rest } = src
+      const parts = [{ type: 'text', text: JSON.stringify(rest, null, 2) }]
+      if (image) parts.push({ type: 'image', attachment: image })
+      return parts
+    },
+  }
+
+  tool({
+    name: 'bili_cover',
+    description: '看一个视频的封面（等比缩到 512px 宽）。最便宜的一档"看一眼"：'
+      + '能看出风格、标题美术、大致题材，但看不出视频里具体发生了什么。',
+    parameters: { bvid: { type: 'string', description: 'BV号' } },
+    output: imageOutput,
+    async execute(args, exec) {
+      const { json, images } = await callRaw('bili_cover', { bvid: String(args.bvid ?? '') })
+      const meta = json && typeof json === 'object' ? json : { raw: json }
+      if (!meta.ok) return meta
+      const img = images[0]
+      if (!img) return { ...meta, ok: false, error: 'MCP 没返回图片' }
+
+      const attachments = ctx.get('attachments')
+      const llm = ctx.get('llm')
+      let canSee = false
+      try {
+        const routed = exec?.agent?.session?.requestHeader?.()?.config
+        const provider = routed?.provider ?? exec?.agent?.options?.provider
+        const model = routed?.model ?? exec?.agent?.options?.model
+        const info = await llm?.resolveModelInfo?.(provider, model, exec?.signal)
+        canSee = Boolean(info?.inputModalities?.includes('image'))
+      } catch { canSee = false }
+
+      if (!attachments?.saveImages || !canSee) {
+        return {
+          ...meta,
+          image_attached: false,
+          hint: canSee
+            ? '宿主的图片服务不可用，封面没能附上（只有文字）'
+            : '当前模型不支持图片输入，封面没能附上（只有文字）—— 换个支持看图的模型再试',
+        }
+      }
+      try {
+        const [ref] = await attachments.saveImages([
+          { data: Buffer.from(img.data, 'base64'), mediaType: img.mimeType },
+        ])
+        return { ...meta, image_attached: true, image: ref }
+      } catch (e) {
+        return { ...meta, image_attached: false, hint: '存图片失败：' + String(e?.message ?? e) }
+      }
     },
   })
 
