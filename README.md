@@ -46,16 +46,19 @@
 ## 装
 
 
-```bash
-# ⭐ 推荐这条（npm 那边账号被暂停，最新版一直在这里）
-dsh plugin --profile web add github:c1overzz/dsh-bili-scroll
+> 🔴 **先看这条：npm 上还是旧版（0.1.7），别用 `add dsh-bili-scroll` 装。**
+> 我们的 npm 发布账号还在申诉里（工单 4880295），2026-10-17 之后的新版本**只能**从下面两条装。
 
-# npm 恢复之后可以改回这条（更快、不用加速器）
-dsh plugin --profile web add dsh-bili-scroll
+```bash
+# ⭐ 首选：Release 里的 tgz 直链（不需要 git，也不会被 pnpm 拦构建脚本）
+dsh plugin --profile web add https://github.com/c1overzz/dsh-bili-scroll/releases/download/v2.0.2/dsh-bili-scroll-2.0.2.tgz
+
+# 备选：git 方式（需要机器上装了 git；pnpm 10 可能拦它的构建脚本）
+dsh plugin --profile web add github:c1overzz/dsh-bili-scroll
 ```
 
-> **github 是目前的主通道。** npm 上的 `latest` 停在 0.1.7（账号被临时暂停，工单处理中），
-> 所以下面「装不上」那一节里凡是提到 npm 的地方，请一律按 github 那条理解。
+> 连不上 github 的话，在链接前面加镜像：`https://gh-proxy.com/`（实测可用，返回的是同一个文件）。
+> 版本号那一节会变，最新的下载地址在 **Releases** 页（`…/releases/latest`）。
 （⭐ 最省事的一条：把仓库链接贴给你自己的 dsh，说「**帮我装这个插件**」，它会自己装。）
 
 ⚠️ 装完**必须重启一次 dsh**（bundle 层要重启才组装）。然后进 **设置 → 刷B站**。
