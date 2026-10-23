@@ -1388,6 +1388,11 @@ async def bili_frames(bvid: str, num: int = 3, at: list | None = None) -> list:
             "error": f"取不到画面快照（试了 2 次）{err}",
         })
 
+    # 覆盖长度以**故事板实测到的那一刻**为准（比 P1 的标称时长保守，通常短 1–10%）
+    story_max = max((e[0] for e in entries), default=0.0)
+    if story_max > 0:
+        covered = min(covered, story_max)
+
     # 目标时间点：传了 at 就用它；否则按"覆盖长度"均分
     if at:
         targets = [min(max(0.0, float(t)), max(0.0, covered - 0.1)) for t in at][:_FRAME_MAX]
